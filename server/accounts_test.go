@@ -2334,6 +2334,182 @@ func TestMultipleStreamImportsWithSameSubject(t *testing.T) {
 	readMsg()
 }
 
+func TestAccountBasicRouteMapping(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddMapping("foo", "bar")
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+
+	acc.RemoveMapping("foo")
+
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending(fsub, 1)
+	checkPending(bsub, 1)
+}
+
+func TestAccountRouteMappingChangesAfterClientStart(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	// Create the client first then add in mapping.
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	nc.Flush()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddMapping("foo", "bar")
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+
+	acc.RemoveMapping("foo")
+
+	nc.Publish("foo", nil)
+	nc.Flush()
+
+	checkPending(fsub, 1)
+	checkPending(bsub, 1)
+}
+
+func TestAccountSimpleWeightedRouteMapping(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+	acc.AddWeightedMappings("foo", &RouteDest{"bar", 50})
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+
+	total := 500
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	fpending, _, _ := fsub.Pending()
+	bpending, _, _ := bsub.Pending()
+
+	h := total / 2
+	tp := h / 5
+	min, max := h-tp, h+tp
+	if fpending < min || fpending > max {
+		t.Fatalf("Expected about %d msgs, got %d and %d", h, fpending, bpending)
+	}
+}
+
+func TestAccountMultiWeightedRouteMappings(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+
+	// Check failures for bad weights.
+	shouldErr := func(rds ...*RouteDest) {
+		t.Helper()
+		if acc.AddWeightedMappings("foo", rds...) == nil {
+			t.Fatalf("Expected an error, got none")
+		}
+	}
+	shouldNotErr := func(rds ...*RouteDest) {
+		t.Helper()
+		if err := acc.AddWeightedMappings("foo", rds...); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	shouldErr(&RouteDest{"bar", 150})
+	shouldNotErr(&RouteDest{"bar", 50})
+	shouldNotErr(&RouteDest{"bar", 50}, &RouteDest{"baz", 50})
+	// Same dest duplicated should error.
+	shouldErr(&RouteDest{"bar", 50}, &RouteDest{"bar", 50})
+	// total over 100
+	shouldErr(&RouteDest{"bar", 50}, &RouteDest{"baz", 60})
+
+	acc.RemoveMapping("foo")
+
+	// 20 for original, you can leave it off will be auto-added.
+	shouldNotErr(&RouteDest{"bar", 50}, &RouteDest{"baz", 30})
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	fsub, _ := nc.SubscribeSync("foo")
+	bsub, _ := nc.SubscribeSync("bar")
+	zsub, _ := nc.SubscribeSync("baz")
+
+	// For checking later.
+	rds := []struct {
+		sub *nats.Subscription
+		w   uint8
+	}{
+		{fsub, 20},
+		{bsub, 50},
+		{zsub, 30},
+	}
+
+	total := 5000
+	for i := 0; i < total; i++ {
+		nc.Publish("foo", nil)
+	}
+	nc.Flush()
+
+	for _, rd := range rds {
+		pending, _, _ := rd.sub.Pending()
+		expected := total / int(100/rd.w)
+		tp := expected / 5 // 20%
+		min, max := expected-tp, expected+tp
+		if pending < min || pending > max {
+			t.Fatalf("Expected about %d msgs for %q, got %d", expected, rd.sub.Subject, pending)
+		}
+	}
+}
+
 func BenchmarkNewRouteReply(b *testing.B) {
 	opts := defaultServerOptions
 	s := New(&opts)

@@ -43,6 +43,9 @@ var (
 	// ErrBadPublishSubject represents an error condition for an invalid publish subject.
 	ErrBadPublishSubject = errors.New("invalid publish subject")
 
+	// ErrBadSubject represents an error condition for an invalid subject.
+	ErrBadSubject = errors.New("invalid subject")
+
 	// ErrBadClientProtocol signals a client requested an invalid client protocol.
 	ErrBadClientProtocol = errors.New("invalid client protocol")
 

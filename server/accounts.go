@@ -64,6 +64,7 @@ type Account struct {
 	lqws         map[string]int32
 	usersRevoked map[string]int64
 	actsRevoked  map[string]int64
+	routeMapping map[string][]*RouteDest
 	lleafs       []*client
 	imports      importMap
 	exports      exportMap
@@ -200,6 +201,12 @@ type importMap struct {
 	streams  []*streamImport
 	services map[string]*serviceImport
 	rrMap    map[string][]*serviceRespEntry
+}
+
+// RouteDest is for rewriting publish subjects for clients.
+type RouteDest struct {
+	Subject string
+	Weight  uint8
 }
 
 // NewAccount creates a new unlimited account with the given name.
@@ -488,6 +495,117 @@ func (a *Account) TotalSubs() int {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return int(a.sl.Count())
+}
+
+// AddMapping adds in a simple route mapping from src subject to dest subject
+// for inbound client messages.
+func (a *Account) AddMapping(src, dest string) error {
+	return a.AddWeightedMappings(src, &RouteDest{dest, 100})
+}
+
+// AddWeightedMapping will add in a weighted mappings for the destinations.
+func (a *Account) AddWeightedMappings(src string, dests ...*RouteDest) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if !IsValidSubject(src) {
+		return ErrBadSubject
+	}
+
+	seen := make(map[string]struct{})
+	ndests := make([]*RouteDest, 0, len(dests)+1)
+	var tw uint8
+	for _, d := range dests {
+		if _, ok := seen[string(d.Subject)]; ok {
+			return fmt.Errorf("duplicate entry for %q", d.Subject)
+		}
+		seen[string(d.Subject)] = struct{}{}
+		if d.Weight > 100 {
+			return fmt.Errorf("individual weights need to be <= 100")
+		}
+		tw += d.Weight
+		if tw > 100 {
+			return fmt.Errorf("total weight needs to be <= 100")
+		}
+		if !IsValidSubject(string(d.Subject)) {
+			return ErrBadSubject
+		}
+		ndests = append(ndests, &RouteDest{d.Subject, d.Weight})
+	}
+
+	// Auto add in original at weight if entries weight does not total 100.
+	if tw != 100 {
+		ndests = append(ndests, &RouteDest{src, 100 - tw})
+	}
+	sort.Slice(ndests, func(i, j int) bool { return ndests[i].Weight < ndests[j].Weight })
+	var lw uint8
+	for _, d := range ndests {
+		d.Weight += lw
+		lw = d.Weight
+	}
+
+	if a.routeMapping == nil {
+		a.routeMapping = make(map[string][]*RouteDest)
+	}
+	// TODO(dlc) - check wildcards
+
+	a.routeMapping[src] = ndests
+	return nil
+}
+
+// RemoveMapping will remove an existing mapping.
+func (a *Account) RemoveMapping(src string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.routeMapping != nil {
+		delete(a.routeMapping, src)
+	}
+}
+
+// Indicates we have mapping entries.
+func (a *Account) hasMappings() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	n := len(a.routeMapping)
+	a.mu.RUnlock()
+	return n > 0
+}
+
+// This performs the logic to map to a new dest subject based on route mappings.
+// Should only be called from processInboundClientMsg.
+func (a *Account) selectMappedSubject(c *client) []byte {
+	dest := c.pa.subject
+	a.mu.RLock()
+
+	if a.routeMapping == nil {
+		a.mu.RUnlock()
+		return dest
+	}
+
+	rms, ok := a.routeMapping[string(dest)]
+	if !ok {
+		a.mu.RUnlock()
+		return dest
+	}
+	// Optimize for single entry case.
+	if len(rms) == 1 && rms[0].Weight == 100 {
+		dest = []byte(rms[0].Subject)
+	} else {
+		if a.prand == nil {
+			a.prand = rand.New(rand.NewSource(time.Now().UnixNano()))
+		}
+		w := uint8(a.prand.Int31n(100))
+		for _, rm := range rms {
+			if w <= rm.Weight {
+				dest = []byte(rm.Subject)
+				break
+			}
+		}
+	}
+	a.mu.RUnlock()
+	return dest
 }
 
 // SubscriptionInterest returns true if this account has a matching subscription

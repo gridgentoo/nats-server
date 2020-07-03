@@ -322,6 +322,13 @@ const (
 	replyPermLimit       = 4096
 )
 
+// Represent read cache booleans with a bitmask
+type readCacheFlag uint16
+
+const (
+	hasMappings readCacheFlag = 1 << iota // For account subject mappings.
+)
+
 // Used in readloop to cache hot subject lookups and group statistics.
 type readCache struct {
 	// These are for clients who are bound to a single account.
@@ -344,6 +351,24 @@ type readCache struct {
 
 	rsz int32 // Read buffer size
 	srs int32 // Short reads, used for dynamic buffer resizing.
+
+	// These are for readcache flags to avoind locks.
+	flags readCacheFlag
+}
+
+// set the flag (would be equivalent to set the boolean to true)
+func (rcf *readCacheFlag) set(c readCacheFlag) {
+	*rcf |= c
+}
+
+// clear the flag (would be equivalent to set the boolean to false)
+func (rcf *readCacheFlag) clear(c readCacheFlag) {
+	*rcf &= ^c
+}
+
+// isSet returns true if the flag is set, false otherwise
+func (rcf readCacheFlag) isSet(c readCacheFlag) bool {
+	return rcf&c != 0
 }
 
 const (
@@ -923,6 +948,18 @@ func (c *client) flushClients(budget time.Duration) time.Time {
 	return last
 }
 
+// Helper to set/clear readcache flag.
+func (c *client) checkAndSetAccountMappings() {
+	if c.kind != CLIENT {
+		return
+	}
+	if c.acc.hasMappings() {
+		c.in.flags.set(hasMappings)
+	} else {
+		c.in.flags.clear(hasMappings)
+	}
+}
+
 // readLoop is the main socket read functionality.
 // Runs in its own Go routine.
 func (c *client) readLoop(pre []byte) {
@@ -947,6 +984,7 @@ func (c *client) readLoop(pre []byte) {
 			c.mcl = int32(opts.MaxControlLine)
 		}
 	}
+
 	// Check the per-account-cache for closed subscriptions
 	cpacc := c.kind == ROUTER || c.kind == GATEWAY
 	// Last per-account-cache check for closed subscriptions
@@ -975,7 +1013,7 @@ func (c *client) readLoop(pre []byte) {
 		wsr.init()
 	}
 
-	// If we have a pre parse that first.
+	// If we have a pre buffer parse that first.
 	if len(pre) > 0 {
 		c.parse(pre)
 	}
@@ -1001,6 +1039,12 @@ func (c *client) readLoop(pre []byte) {
 			bufs[0] = b[:n]
 		}
 		start := time.Now()
+
+		// Check if the account has mappings and if so set the local readcache flag.
+		// We check here to make sure any changes such as config reload are reflected here.
+		if c.kind == CLIENT {
+			c.checkAndSetAccountMappings()
+		}
 
 		// Clear inbound stats cache
 		c.in.msgs = 0
@@ -3229,6 +3273,16 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 		return false
 	}
 
+	// Mostly under testing scenarios.
+	if c.srv == nil || c.acc == nil {
+		return false
+	}
+
+	// Check if we have and account mappings or tees or filters.
+	if c.kind == CLIENT && c.in.flags.isSet(hasMappings) {
+		c.pa.subject = c.acc.selectMappedSubject(c)
+	}
+
 	// Check pub permissions
 	if c.perms != nil && (c.perms.pub.allow != nil || c.perms.pub.deny != nil) && !c.pubAllowed(string(c.pa.subject)) {
 		c.pubPermissionViolation(c.pa.subject)
@@ -3243,11 +3297,6 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 
 	if c.opts.Verbose {
 		c.sendOK()
-	}
-
-	// Mostly under testing scenarios.
-	if c.srv == nil || c.acc == nil {
-		return false
 	}
 
 	// Check if this client's gateway replies map is not empty
