@@ -2370,6 +2370,56 @@ func TestAccountBasicRouteMapping(t *testing.T) {
 	checkPending(bsub, 1)
 }
 
+func TestAccountWildcardRouteMapping(t *testing.T) {
+	opts := DefaultOptions()
+	opts.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
+
+	addMap := func(src, dest string) {
+		t.Helper()
+		if err := acc.AddMapping(src, dest); err != nil {
+			t.Fatalf("Error adding mapping: %v", err)
+		}
+	}
+
+	addMap("foo.*.*", "bar.$2.$1")
+	addMap("bar.*.>", "baz.$1.>")
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	pub := func(subj string) {
+		t.Helper()
+		err := nc.Publish(subj, nil)
+		if err == nil {
+			err = nc.Flush()
+		}
+		if err != nil {
+			t.Fatalf("Error publishing: %v", err)
+		}
+	}
+
+	fsub, _ := nc.SubscribeSync("foo.>")
+	bsub, _ := nc.SubscribeSync("bar.>")
+	zsub, _ := nc.SubscribeSync("baz.>")
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	pub("foo.1.2")
+
+	checkPending(fsub, 0)
+	checkPending(bsub, 1)
+	checkPending(zsub, 0)
+}
+
 func TestAccountRouteMappingChangesAfterClientStart(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Port = -1
@@ -2416,7 +2466,7 @@ func TestAccountSimpleWeightedRouteMapping(t *testing.T) {
 	defer s.Shutdown()
 
 	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
-	acc.AddWeightedMappings("foo", &RouteDest{"bar", 50})
+	acc.AddWeightedMappings("foo", &MapDest{"bar", 50})
 
 	nc := natsConnect(t, s.ClientURL())
 	defer nc.Close()
@@ -2450,31 +2500,31 @@ func TestAccountMultiWeightedRouteMappings(t *testing.T) {
 	acc, _ := s.LookupAccount(DEFAULT_GLOBAL_ACCOUNT)
 
 	// Check failures for bad weights.
-	shouldErr := func(rds ...*RouteDest) {
+	shouldErr := func(rds ...*MapDest) {
 		t.Helper()
 		if acc.AddWeightedMappings("foo", rds...) == nil {
 			t.Fatalf("Expected an error, got none")
 		}
 	}
-	shouldNotErr := func(rds ...*RouteDest) {
+	shouldNotErr := func(rds ...*MapDest) {
 		t.Helper()
 		if err := acc.AddWeightedMappings("foo", rds...); err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 	}
 
-	shouldErr(&RouteDest{"bar", 150})
-	shouldNotErr(&RouteDest{"bar", 50})
-	shouldNotErr(&RouteDest{"bar", 50}, &RouteDest{"baz", 50})
+	shouldErr(&MapDest{"bar", 150})
+	shouldNotErr(&MapDest{"bar", 50})
+	shouldNotErr(&MapDest{"bar", 50}, &MapDest{"baz", 50})
 	// Same dest duplicated should error.
-	shouldErr(&RouteDest{"bar", 50}, &RouteDest{"bar", 50})
+	shouldErr(&MapDest{"bar", 50}, &MapDest{"bar", 50})
 	// total over 100
-	shouldErr(&RouteDest{"bar", 50}, &RouteDest{"baz", 60})
+	shouldErr(&MapDest{"bar", 50}, &MapDest{"baz", 60})
 
 	acc.RemoveMapping("foo")
 
 	// 20 for original, you can leave it off will be auto-added.
-	shouldNotErr(&RouteDest{"bar", 50}, &RouteDest{"baz", 30})
+	shouldNotErr(&MapDest{"bar", 50}, &MapDest{"baz", 30})
 
 	nc := natsConnect(t, s.ClientURL())
 	defer nc.Close()
@@ -2578,4 +2628,56 @@ func TestSamplingHeader(t *testing.T) {
 
 	test(true, http.Header{"traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}})
 	test(false, http.Header{"traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"}})
+}
+
+func TestSubjectTransforms(t *testing.T) {
+	shouldErr := func(src, dest string) {
+		t.Helper()
+		if _, err := newTransform(src, dest); err != ErrBadSubject {
+			t.Fatalf("Did not get an error for src=%q and dest=%q", src, dest)
+		}
+	}
+
+	// Must be valid subjects.
+	shouldErr("foo", "")
+	shouldErr("foo..", "bar")
+
+	// Wildcards are allowed in src, but must be matched by token placements on the other side.
+	// e.g. foo.* -> bar.$1.
+	// Need to have as many pwcs as placements on other side.
+	shouldErr("foo.*", "bar.*")
+	shouldErr("foo.*", "bar.$2")   // Bad pwc token identifier
+	shouldErr("foo.*", "bar.$1.>") // fwcs have to match.
+	shouldErr("foo.>", "bar.baz")  // fwcs have to match.
+	shouldErr("foo.*.*", "bar.$2") // Must place all pwcs.
+
+	shouldBeOK := func(src, dest string) *transform {
+		t.Helper()
+		tr, err := newTransform(src, dest)
+		if err != nil {
+			t.Fatalf("Got an error %v for src=%q and dest=%q", err, src, dest)
+		}
+		return tr
+	}
+
+	shouldBeOK("foo", "bar")
+	shouldBeOK("foo.*.bar.*.baz", "req.$2.$1")
+	shouldBeOK("baz.>", "mybaz.>")
+
+	shouldMatch := func(src, dest, sample, expected string) {
+		t.Helper()
+		tr := shouldBeOK(src, dest)
+		s, err := tr.match(sample)
+		if err != nil {
+			t.Fatalf("Got an error %v when expecting a match for %q to %q", err, sample, expected)
+		}
+		if s != expected {
+			t.Fatalf("Dest does not match what was expected. Got %q, expected %q", s, expected)
+		}
+	}
+
+	shouldMatch("foo", "bar", "foo", "bar")
+	shouldMatch("foo.*.bar.*.baz", "req.$2.$1", "foo.A.bar.B.baz", "req.B.A")
+	shouldMatch("baz.>", "my.pre.>", "baz.1.2.3", "my.pre.1.2.3")
+	shouldMatch("baz.>", "foo.bar.>", "baz.1.2.3", "foo.bar.1.2.3")
 }
