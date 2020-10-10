@@ -2560,6 +2560,48 @@ func TestAccountMultiWeightedRouteMappings(t *testing.T) {
 	}
 }
 
+func TestAccountServiceImportWithRouteMappings(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+    accounts {
+      foo {
+        users = [{user: derek, password: foo}]
+        exports = [{service: "request"}]
+      }
+      bar {
+        users = [{user: ivan, password: bar}]
+        imports = [{service: {account: "foo", subject:"request"}}]
+      }
+    }
+    `))
+	defer os.Remove(cf)
+
+	s, opts := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	acc, _ := s.LookupAccount("foo")
+	acc.AddMapping("request", "request.v2")
+
+	// Create the service client first.
+	ncFoo := natsConnect(t, fmt.Sprintf("nats://derek:foo@%s:%d", opts.Host, opts.Port))
+	defer ncFoo.Close()
+
+	fooSub := natsSubSync(t, ncFoo, "request.v2")
+
+	// Requestor
+	ncBar := natsConnect(t, fmt.Sprintf("nats://ivan:bar@%s:%d", opts.Host, opts.Port))
+	defer ncBar.Close()
+
+	ncBar.Publish("request", nil)
+	ncBar.Flush()
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if n, _, _ := fooSub.Pending(); n != 1 {
+			return fmt.Errorf("Expected a request for %q, but got %d", fooSub.Subject, n)
+		}
+		return nil
+	})
+}
+
 func BenchmarkNewRouteReply(b *testing.B) {
 	opts := defaultServerOptions
 	s := New(&opts)

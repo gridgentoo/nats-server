@@ -948,18 +948,6 @@ func (c *client) flushClients(budget time.Duration) time.Time {
 	return last
 }
 
-// Helper to set/clear readcache flag.
-func (c *client) checkAndSetAccountMappings() {
-	if c.kind != CLIENT {
-		return
-	}
-	if c.acc.hasMappings() {
-		c.in.flags.set(hasMappings)
-	} else {
-		c.in.flags.clear(hasMappings)
-	}
-}
-
 // readLoop is the main socket read functionality.
 // Runs in its own Go routine.
 func (c *client) readLoop(pre []byte) {
@@ -972,6 +960,7 @@ func (c *client) readLoop(pre []byte) {
 		c.mu.Unlock()
 		return
 	}
+	acc := c.acc
 	nc := c.nc
 	ws := c.ws != nil
 	c.in.rsz = startBufSize
@@ -1042,8 +1031,12 @@ func (c *client) readLoop(pre []byte) {
 
 		// Check if the account has mappings and if so set the local readcache flag.
 		// We check here to make sure any changes such as config reload are reflected here.
-		if c.kind == CLIENT {
-			c.checkAndSetAccountMappings()
+		if c.kind == CLIENT && acc != nil {
+			if acc.hasMappings() {
+				c.in.flags.set(hasMappings)
+			} else {
+				c.in.flags.clear(hasMappings)
+			}
 		}
 
 		// Clear inbound stats cache
@@ -3260,6 +3253,11 @@ func (c *client) processInboundMsg(msg []byte) {
 	}
 }
 
+// selectMappedSubject will chose the mapped subject based on the client's inbound subject.
+func (c *client) selectMappedSubject() {
+	c.pa.subject = []byte(c.acc.selectMappedSubject(string(c.pa.subject)))
+}
+
 // processInboundClientMsg is called to process an inbound msg from a client.
 func (c *client) processInboundClientMsg(msg []byte) bool {
 	// Update statistics
@@ -3280,7 +3278,7 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 
 	// Check if we have and account mappings or tees or filters.
 	if c.kind == CLIENT && c.in.flags.isSet(hasMappings) {
-		c.pa.subject = c.acc.selectMappedSubject(c)
+		c.selectMappedSubject()
 	}
 
 	// Check pub permissions
@@ -3520,6 +3518,11 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 	if si.hasWC {
 		to = string(c.pa.subject)
 	}
+
+	// Now check to see if this account has mappings that could affect the service import.
+	// Can't use non locked trick like in processInboundClientMsg, so just call into selectMappedSubject
+	// so we only lock once.
+	to = si.acc.selectMappedSubject(to)
 
 	// FIXME(dlc) - Do L1 cache trick like normal client?
 	rr := si.acc.sl.Match(to)

@@ -608,11 +608,9 @@ func (a *Account) hasMappings() bool {
 }
 
 // This performs the logic to map to a new dest subject based on mappings.
-// Should only be called from processInboundClientMsg.
-func (a *Account) selectMappedSubject(c *client) []byte {
-	dest := c.pa.subject
+// Should only be called from processInboundClientMsg or service import processing.
+func (a *Account) selectMappedSubject(dest string) string {
 	a.mu.RLock()
-
 	if len(a.mappings) == 0 {
 		a.mu.RUnlock()
 		return dest
@@ -624,14 +622,14 @@ func (a *Account) selectMappedSubject(c *client) []byte {
 
 	var m *mapping
 	for _, rm := range a.mappings {
-		if !rm.wc && rm.src == string(dest) {
+		if !rm.wc && rm.src == dest {
 			m = rm
 			break
 		} else {
 			// tokenize and reuse for subset matching.
 			if len(tts) == 0 {
 				start := 0
-				subject := string(dest)
+				subject := dest
 				for i := 0; i < len(subject); i++ {
 					if subject[i] == btsep {
 						tts = append(tts, subject[start:i])
@@ -673,9 +671,9 @@ func (a *Account) selectMappedSubject(c *client) []byte {
 
 	if d != nil {
 		if len(d.tr.dtpi) == 0 {
-			dest = []byte(d.tr.dest)
+			dest = d.tr.dest
 		} else if nsubj, err := d.tr.transform(tts); err == nil {
-			dest = []byte(nsubj)
+			dest = nsubj
 		}
 	}
 
