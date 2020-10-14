@@ -603,6 +603,14 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 	case "logtime":
 		o.Logtime = v.(bool)
 		trackExplicitVal(o, &o.inConfig, "Logtime", o.Logtime)
+	case "mappings", "maps":
+		gacc := NewAccount(globalAccountName)
+		o.Accounts = append(o.Accounts, gacc)
+		err := parseAccountMappings(tk, gacc, errors, warnings)
+		if err != nil {
+			*errors = append(*errors, err)
+			return
+		}
 	case "disable_sublist_cache", "no_sublist_cache":
 		o.NoSublistCache = v.(bool)
 	case "accounts":
@@ -1844,6 +1852,99 @@ func isReservedAccount(name string) bool {
 	return name == globalAccountName
 }
 
+// parseAccountMappings is called to parse account mappings.
+func parseAccountMappings(v interface{}, acc *Account, errors *[]error, warnings *[]error) error {
+	var lt token
+	defer convertPanicToErrorList(&lt, errors)
+
+	tk, v := unwrapValue(v, &lt)
+	am := v.(map[string]interface{})
+	for subj, mv := range am {
+		if !IsValidSubject(subj) {
+			err := &configErr{tk, fmt.Sprintf("Subject %q is not a valid subject", subj)}
+			*errors = append(*errors, err)
+			continue
+		}
+		tk, v := unwrapValue(mv, &lt)
+
+		switch vv := v.(type) {
+		case string:
+			if err := acc.AddMapping(subj, v.(string)); err != nil {
+				err := &configErr{tk, fmt.Sprintf("Error adding mapping for %q: %v", subj, err)}
+				*errors = append(*errors, err)
+				continue
+			}
+		case []interface{}:
+			var mappings []*MapDest
+			for _, mv := range v.([]interface{}) {
+				tk, amv := unwrapValue(mv, &lt)
+				// These should be maps.
+				mv, ok := amv.(map[string]interface{})
+				if !ok {
+					err := &configErr{tk, "Expected an entry for the mapping destination"}
+					*errors = append(*errors, err)
+					continue
+				}
+				mdest := &MapDest{}
+				for k, v := range mv {
+					tk, dmv := unwrapValue(v, &lt)
+					switch strings.ToLower(k) {
+					case "dest", "destination":
+						mdest.Subject = dmv.(string)
+					case "weight":
+						switch vv := dmv.(type) {
+						case string:
+							ws := vv
+							if strings.HasSuffix(ws, "%") {
+								ws = ws[:len(ws)-1]
+							}
+							weight, err := strconv.Atoi(ws)
+							if err != nil {
+								err := &configErr{tk, fmt.Sprintf("Invalid weight %q for mapping destination", ws)}
+								*errors = append(*errors, err)
+								continue
+							}
+							if weight > 100 || weight < 0 {
+								err := &configErr{tk, fmt.Sprintf("Invalid weight %d for mapping destination", weight)}
+								*errors = append(*errors, err)
+								continue
+							}
+							mdest.Weight = uint8(weight)
+						case int64:
+							weight := vv
+							if weight > 100 || weight < 0 {
+								err := &configErr{tk, fmt.Sprintf("Invalid weight %d for mapping destination", weight)}
+								*errors = append(*errors, err)
+								continue
+							}
+							mdest.Weight = uint8(weight)
+						}
+					default:
+						err := &configErr{tk, fmt.Sprintf("Unknown field %q for mapping destination", k)}
+						*errors = append(*errors, err)
+						continue
+					}
+				}
+				mappings = append(mappings, mdest)
+			}
+
+			// Now add them in..
+			if err := acc.AddWeightedMappings(subj, mappings...); err != nil {
+				err := &configErr{tk, fmt.Sprintf("Error adding mapping for %q: %v", subj, err)}
+				*errors = append(*errors, err)
+				continue
+			}
+
+		default:
+			err := &configErr{tk, fmt.Sprintf("Unknown type %T for mapping destination", vv)}
+			*errors = append(*errors, err)
+			continue
+		}
+	}
+
+	return nil
+}
+
 // parseAccounts will parse the different accounts syntax.
 func parseAccounts(v interface{}, opts *Options, errors *[]error, warnings *[]error) error {
 	var (
@@ -1958,6 +2059,12 @@ func parseAccounts(v interface{}, opts *Options, errors *[]error, warnings *[]er
 						continue
 					}
 					acc.defaultPerms = permissions
+				case "mappings", "maps":
+					err := parseAccountMappings(tk, acc, errors, warnings)
+					if err != nil {
+						*errors = append(*errors, err)
+						continue
+					}
 				default:
 					if !tk.IsUsedVariable() {
 						err := &unknownConfigFieldErr{

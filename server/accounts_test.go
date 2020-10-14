@@ -2560,6 +2560,81 @@ func TestAccountMultiWeightedRouteMappings(t *testing.T) {
 	}
 }
 
+func TestGlobalAccountRouteMappingsConfiguration(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	mappings = {
+		foo: bar
+		foo.*: [ { dest: bar.v1.$1, weight: 40% }, { destination: baz.v2.$1, weight: 20 } ]
+		bar.*.*: RAB.$2.$1
+    }
+    `))
+	defer os.Remove(cf)
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	bsub, _ := nc.SubscribeSync("bar")
+	fsub1, _ := nc.SubscribeSync("bar.v1.>")
+	fsub2, _ := nc.SubscribeSync("baz.v2.>")
+	zsub, _ := nc.SubscribeSync("RAB.>")
+	f22sub, _ := nc.SubscribeSync("foo.*")
+
+	checkPending := func(sub *nats.Subscription, expected int) {
+		t.Helper()
+		if n, _, _ := sub.Pending(); n != expected {
+			t.Fatalf("Expected %d msgs for %q, but got %d", expected, sub.Subject, n)
+		}
+	}
+
+	nc.Publish("foo", nil)
+	nc.Publish("bar.11.22", nil)
+
+	total := 500
+	for i := 0; i < total; i++ {
+		nc.Publish("foo.22", nil)
+	}
+	nc.Flush()
+
+	checkPending(bsub, 1)
+	checkPending(zsub, 1)
+
+	fpending, _, _ := f22sub.Pending()
+	fpending1, _, _ := fsub1.Pending()
+	fpending2, _, _ := fsub2.Pending()
+
+	if fpending1 < fpending2 || fpending < fpending2 {
+		t.Fatalf("Loadbalancing seems off for the foo.* mappings: %d and %d and %d", fpending, fpending1, fpending2)
+	}
+}
+
+func TestAccountRouteMappingsConfiguration(t *testing.T) {
+	cf := createConfFile(t, []byte(`
+	accounts {
+		synadia {
+			users = [{user: derek, password: foo}]
+			mappings = {
+				foo: bar
+				foo.*: [ { dest: bar.v1.$1, weight: 40% }, { destination: baz.v2.$1, weight: 20 } ]
+				bar.*.*: RAB.$2.$1
+		    }
+		}
+	}
+    `))
+	defer os.Remove(cf)
+
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+
+	// We test functionality above, so for this one just make sure we have mappings for the account.
+	acc, _ := s.LookupAccount("synadia")
+	if !acc.hasMappings() {
+		t.Fatalf("Account %q does not have mappings", "synadia")
+	}
+}
+
 func TestAccountServiceImportWithRouteMappings(t *testing.T) {
 	cf := createConfFile(t, []byte(`
     accounts {

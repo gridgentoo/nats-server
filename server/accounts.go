@@ -554,7 +554,23 @@ func (a *Account) AddWeightedMappings(src string, dests ...*MapDest) error {
 
 	// Auto add in original at weight if all entries weight does not total to 100.
 	if tw != 100 {
-		tr, err := newTransform(src, src)
+		dest := src
+		if m.wc {
+			// We need to make the appropriate markers for the wildcards etc.
+			i := 1
+			var nda []string
+			for _, token := range strings.Split(dest, tsep) {
+				if token == "*" {
+					nda = append(nda, fmt.Sprintf("$%d", i))
+					i++
+				} else {
+					nda = append(nda, token)
+				}
+			}
+			dest = strings.Join(nda, tsep)
+		}
+
+		tr, err := newTransform(src, dest)
 		if err != nil {
 			return err
 		}

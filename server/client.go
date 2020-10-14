@@ -960,7 +960,6 @@ func (c *client) readLoop(pre []byte) {
 		c.mu.Unlock()
 		return
 	}
-	acc := c.acc
 	nc := c.nc
 	ws := c.ws != nil
 	c.in.rsz = startBufSize
@@ -1031,8 +1030,8 @@ func (c *client) readLoop(pre []byte) {
 
 		// Check if the account has mappings and if so set the local readcache flag.
 		// We check here to make sure any changes such as config reload are reflected here.
-		if c.kind == CLIENT && acc != nil {
-			if acc.hasMappings() {
+		if c.kind == CLIENT {
+			if c.acc.hasMappings() {
 				c.in.flags.set(hasMappings)
 			} else {
 				c.in.flags.clear(hasMappings)
@@ -3274,11 +3273,6 @@ func (c *client) processInboundClientMsg(msg []byte) bool {
 	// Mostly under testing scenarios.
 	if c.srv == nil || c.acc == nil {
 		return false
-	}
-
-	// Check if we have and account mappings or tees or filters.
-	if c.kind == CLIENT && c.in.flags.isSet(hasMappings) {
-		c.selectMappedSubject()
 	}
 
 	// Check pub permissions
